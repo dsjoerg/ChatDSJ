@@ -47,6 +47,7 @@ else:
 
 channel_data = {} # {channel_id: {"message_count": int, "participants": set(), "last_updated": datetime}}
 emoji_tally = defaultdict(int) # {emoji_name: count}
+user_nicknames = {} # {user_id: nickname}
 bot_user_id: Optional[str] = None
 openai_usage_costs = defaultdict(float) # {model_name: cost}
 openai_token_counts = defaultdict(lambda: defaultdict(int)) # {model_name: {prompt_tokens: count, ...}}
@@ -130,7 +131,10 @@ def format_conversation_history_for_openai(messages: List[Dict[str, Any]], clien
         text = msg.get("text", "")
         username = "Unknown"
         if uid:
-            if uid in user_cache: username = user_cache[uid]
+            if uid in user_nicknames:
+                username = user_nicknames[uid]
+            elif uid in user_cache:
+                username = user_cache[uid]
             else:
                 try:
                     info = client.users_info(user=uid)
@@ -268,6 +272,30 @@ def handle_mention(event, say, client, logger):
                 emoji_text += f"- :{emoji}:: {count}\n"
         say(text=emoji_text, thread_ts=thread_ts)
         return
+    if prompt.lower() == "nicknames":
+        nick_text = "User Nicknames:\n"
+        if not user_nicknames:
+            nick_text += "No nicknames set yet."
+        else:
+            for uid, nickname in user_nicknames.items():
+                nick_text += f"- <@{uid}>: {nickname}\n"
+        say(text=nick_text, thread_ts=thread_ts)
+        return
+    if prompt.lower().startswith("nickname "):
+        new_nickname = prompt[9:].strip()
+        if new_nickname:
+            user_nicknames[user_id] = new_nickname
+            say(text=f"Your nickname has been set to '{new_nickname}'.", thread_ts=thread_ts)
+        else:
+            say(text="Please provide a nickname. Usage: `nickname [your nickname]`", thread_ts=thread_ts)
+        return
+    if prompt.lower() == "resetname":
+        if user_id in user_nicknames:
+            del user_nicknames[user_id]
+            say(text="Your nickname has been reset to your default Slack name.", thread_ts=thread_ts)
+        else:
+            say(text="You don't have a custom nickname set.", thread_ts=thread_ts)
+        return
 
     update_channel_stats(channel_id, user_id, message_ts)
 
@@ -337,6 +365,30 @@ def handle_message_events(event, say, client, logger):
             else:
                 for emoji, count in emoji_tally.items(): emoji_text += f"- :{emoji}:: {count}\n"
             say(text=emoji_text, thread_ts=thread_ts)
+            return
+        if text.lower() == "nicknames":
+            nick_text = "User Nicknames:\n"
+            if not user_nicknames:
+                nick_text += "No nicknames set yet."
+            else:
+                for uid, nickname in user_nicknames.items():
+                    nick_text += f"- <@{uid}>: {nickname}\n"
+            say(text=nick_text, thread_ts=thread_ts)
+            return
+        if text.lower().startswith("nickname "):
+            new_nickname = text[9:].strip()
+            if new_nickname:
+                user_nicknames[user_id] = new_nickname
+                say(text=f"Your nickname has been set to '{new_nickname}'.", thread_ts=thread_ts)
+            else:
+                say(text="Please provide a nickname. Usage: `nickname [your nickname]`", thread_ts=thread_ts)
+            return
+        if text.lower() == "resetname":
+            if user_id in user_nicknames:
+                del user_nicknames[user_id]
+                say(text="Your nickname has been reset to your default Slack name.", thread_ts=thread_ts)
+            else:
+                say(text="You don't have a custom nickname set.", thread_ts=thread_ts)
             return
 
         use_web_search = True # Enable web search by default

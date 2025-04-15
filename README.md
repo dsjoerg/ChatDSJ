@@ -83,6 +83,7 @@ poetry run uvicorn app.main:app --reload
    - Invite the bot to a channel in your Slack workspace
    - Mention the bot by typing @ChatDSJ Bot in the channel
    - The bot should respond with a rude phrase and channel statistics
+   - Available commands: `stats`, `cost`, `emojis`, `nicknames`, `nickname [your nickname]`, `resetname`
 
 6. Run the tests:
    ```bash
