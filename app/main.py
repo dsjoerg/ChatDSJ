@@ -3,11 +3,18 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import threading
 from dotenv import load_dotenv
+from app.slack.app import create_slack_app, IS_DUMMY_APP
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+
 
 # Load environment variables
 load_dotenv()
 
+slack_app = create_slack_app()
 app = FastAPI()
+
+if not IS_DUMMY_APP:
+    SocketModeHandler(slack_app, os.environ["SLACK_APP_TOKEN"]).start()
 
 # Disable CORS. Do not remove this for full-stack development.
 app.add_middleware(
@@ -18,40 +25,22 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# Slack bot integration
-from app.slack.app import app as slack_app
-
 # Start the Slack bot in a separate thread when FastAPI starts
 @app.on_event("startup")
 async def startup_event():
-    # Check if Slack credentials are set
-    slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
-    slack_signing_secret = os.environ.get("SLACK_SIGNING_SECRET")
     slack_app_token = os.environ.get("SLACK_APP_TOKEN")
-    
-    if slack_bot_token and slack_signing_secret and slack_app_token:
-        try:
-            if not hasattr(slack_app, 'logger'):
-                print("Using dummy Slack app, skipping Socket Mode initialization")
-                return
-                
-            def start_slack_app():
-                from slack_bolt.adapter.socket_mode import SocketModeHandler
-                print(f"Initializing Socket Mode with app token: {slack_app_token[:5]}...")
-                handler = SocketModeHandler(slack_app, slack_app_token)
-                handler.start()
-            
-            # Start the Slack app in a separate thread
-            threading.Thread(target=start_slack_app, daemon=True).start()
-            print("Slack bot started successfully")
-        except Exception as e:
-            print(f"Failed to start Slack bot: {e}")
-    else:
-        missing_vars = []
-        if not slack_bot_token: missing_vars.append("SLACK_BOT_TOKEN")
-        if not slack_signing_secret: missing_vars.append("SLACK_SIGNING_SECRET") 
-        if not slack_app_token: missing_vars.append("SLACK_APP_TOKEN")
-        print(f"Slack credentials not set: {', '.join(missing_vars)}, skipping Slack bot initialization")
+    if IS_DUMMY_APP or not slack_app_token:
+        print("Slack bot is in dummy mode or SLACK_APP_TOKEN missing — skipping Socket Mode.")
+        return
+
+    def start_slack():
+        from slack_bolt.adapter.socket_mode import SocketModeHandler
+        print(f"Starting Slack SocketModeHandler...")
+        handler = SocketModeHandler(slack_app, slack_app_token)
+        handler.start()
+
+    threading.Thread(target=start_slack, daemon=True).start()
+    print("Slack bot thread launched.")
 
 @app.get("/healthz")
 async def healthz():
@@ -59,7 +48,7 @@ async def healthz():
 
 @app.get("/test-chatgpt")
 async def test_chatgpt():
-    from app.slack.app import get_openai_response, format_conversation_history_for_openai
+    from app.slack.app import get_openai_response
     test_prompt = "Can you help me with my Python code?"
     response_text, usage = get_openai_response([], test_prompt) # Pass empty history for simplicity
     response = {"response": response_text, "usage": usage}

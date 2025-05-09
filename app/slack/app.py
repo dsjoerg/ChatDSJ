@@ -1,65 +1,29 @@
-from slack_bolt import App
-from slack_sdk.errors import SlackApiError
-from slack_bolt.adapter.socket_mode import SocketModeHandler
 import os
 import random
 import re
-from openai import OpenAI
 import logging
-from typing import Optional, Dict, Any, Tuple, List
-
 from datetime import datetime
 from collections import defaultdict
+from typing import Optional, Dict, Any, Tuple, List
+
+from slack_bolt import App
+from slack_sdk.errors import SlackApiError
+from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-try:
-    slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
-    slack_signing_secret = os.environ.get("SLACK_SIGNING_SECRET")
-    if not slack_bot_token or not slack_signing_secret:
-        raise ValueError("SLACK_BOT_TOKEN and SLACK_SIGNING_SECRET must be set")
-    app = App(token=slack_bot_token, signing_secret=slack_signing_secret)
-    logger.info("Slack app initialized successfully")
-    IS_DUMMY_APP = False
-except Exception as e:
-    logger.error(f"Failed to initialize Slack app: {e}. Using DummyApp.")
-    class DummyApp: # Dummy app to prevent crashes if init fails
-        def __init__(self): self.client = None
-        def event(self, event_type): return lambda func: func
-        def error(self, func): return func
-        def message(self, *args, **kwargs): return lambda func: func
-        def reaction_added(self, *args, **kwargs): return lambda func: func
-    app = DummyApp()
-    IS_DUMMY_APP = True
-
+# Global flags and objects
+IS_DUMMY_APP = False
 openai_client: Optional[OpenAI] = None
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if OPENAI_API_KEY:
-    try:
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        logger.info(f"OpenAI client initialized successfully for model {OPENAI_MODEL}")
-    except Exception as e:
-        logger.error(f"Failed to initialize OpenAI client: {e}")
-else:
-    logger.warning("OPENAI_API_KEY not found. OpenAI features will be disabled.")
-
-channel_data = {} # {channel_id: {"message_count": int, "participants": set(), "last_updated": datetime}}
-emoji_tally = defaultdict(int) # {emoji_name: count}
 bot_user_id: Optional[str] = None
-openai_usage_costs = defaultdict(float) # {model_name: cost}
-openai_token_counts = defaultdict(lambda: defaultdict(int)) # {model_name: {prompt_tokens: count, ...}}
-bot_message_timestamps = set() # Store ts of messages sent by the bot
 
-if not IS_DUMMY_APP:
-    try:
-        auth_test_result = app.client.auth_test()
-        bot_user_id = auth_test_result.get("user_id")
-        if bot_user_id: logger.info(f"Bot User ID fetched: {bot_user_id} (Test Bot)")
-        else: logger.error("Could not get bot_user_id from auth.test result.")
-    except Exception as e: logger.error(f"Error fetching bot user ID: {e}")
-
+# Shared memory
+channel_data = {}
+emoji_tally = defaultdict(int)
+openai_usage_costs = defaultdict(float)
+openai_token_counts = defaultdict(lambda: defaultdict(int))
+bot_message_timestamps = set()
 
 RUDE_PHRASES = [
     "Do I look like I care?",
@@ -73,6 +37,180 @@ RUDE_PHRASES = [
     "Ugh, what now?",
     "You again? Seriously?"
 ]
+
+SYSTEM_PROMPT = os.getenv("OPENAI_SYSTEM_PROMPT", "You are a helpful assistant in a Slack conversation. Be concise.")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+def create_slack_app():
+    global openai_client, bot_user_id, IS_DUMMY_APP
+
+    slack_bot_token = os.environ.get("SLACK_BOT_TOKEN")
+    slack_signing_secret = os.environ.get("SLACK_SIGNING_SECRET")
+
+    if not slack_bot_token or not slack_signing_secret:
+        logger.warning("Missing SLACK_BOT_TOKEN or SLACK_SIGNING_SECRET — using DummyApp.")
+        IS_DUMMY_APP = True
+
+        class DummyApp:
+            def __init__(self): self.client = None
+            def event(self, *args, **kwargs): return lambda f: f
+            def error(self, f): return f
+            def message(self, *args, **kwargs): return lambda f: f
+            def reaction_added(self, *args, **kwargs): return lambda f: f
+
+        return DummyApp()
+
+    logger.info("Slack app initialized successfully.")
+    app = App(token=slack_bot_token, signing_secret=slack_signing_secret)
+
+    # Auth check
+    try:
+        auth_test = app.client.auth_test()
+        bot_user_id = auth_test.get("user_id")
+        logger.info(f"Bot User ID: {bot_user_id}")
+    except Exception as e:
+        logger.warning(f"Failed to fetch bot user ID: {e}")
+
+    # Init OpenAI client
+    if OPENAI_API_KEY:
+        try:
+            openai_client = OpenAI(api_key=OPENAI_API_KEY)
+            logger.info("OpenAI client initialized.")
+        except Exception as e:
+            logger.warning(f"Failed to init OpenAI client: {e}")
+    else:
+        logger.warning("No OPENAI_API_KEY found — OpenAI features disabled.")
+    
+    @app.event("app_mention")
+    def handle_mention(event, say, client, logger):
+        if IS_DUMMY_APP:
+            say("Slack app is not fully initialized. Cannot process mentions.")
+            return
+
+        channel_id = event["channel"]
+        user_id = event["user"]
+        message_ts = event["ts"]
+        text = event.get("text", "")
+        thread_ts = event.get("thread_ts") # Handle threads
+
+        prompt = re.sub(f"<@{bot_user_id}>", "", text).strip()
+
+        if prompt.lower() == "stats":
+            stats = get_channel_stats(channel_id)
+            participants_list = ", ".join([f"<@{user}>" for user in stats["participants"]])
+            stats_text = (f"Channel Stats ({channel_id}):\n"
+                        f"- Messages: {stats['message_count']}\n"
+                        f"- Participants ({len(stats['participants'])}): {participants_list}\n"
+                        f"- Last Updated: {stats['last_updated']}")
+            say(text=stats_text, thread_ts=thread_ts) # Reply in thread if applicable
+            return
+        if prompt.lower() == "cost":
+            cost_text = "OpenAI API Usage Costs:\n"
+            if not openai_usage_costs: cost_text += "No usage recorded yet."
+            else:
+                for model, cost in openai_usage_costs.items():
+                    cost_text += f"- {model}: ${cost:.6f}\n"
+                cost_text += "\nToken Counts:\n"
+                for model, counts in openai_token_counts.items():
+                    cost_text += f"- {model}: Prompt={counts['prompt_tokens']}, Completion={counts['completion_tokens']}, Total={counts['total_tokens']}\n"
+            say(text=cost_text, thread_ts=thread_ts)
+            return
+        if prompt.lower() == "emojis":
+            emoji_text = "Emoji Reaction Tally (on my messages):\n"
+            if not emoji_tally: emoji_text += "No reactions recorded yet."
+            else:
+                for emoji, count in emoji_tally.items():
+                    emoji_text += f"- :{emoji}:: {count}\n"
+            say(text=emoji_text, thread_ts=thread_ts)
+            return
+
+        update_channel_stats(channel_id, user_id, message_ts)
+
+        use_web_search = True # Enable web search by default
+
+        history = get_channel_history(client, channel_id, limit=1000) # Fetch up to 1000 messages
+        history_limit_reached = len(history) == 1000
+        history_formatted = format_conversation_history_for_openai(history, client)
+        response_text, usage = get_openai_response(history_formatted, prompt, web_search=True)
+        if history_limit_reached:
+            response_text = "(Note: I could only access the last 1000 messages in this channel for context.)\n\n" + (response_text or "")
+
+        if response_text:
+            say_result = say(text=response_text, thread_ts=thread_ts) # Reply in thread if applicable
+            record_bot_message(say_result)
+        else:
+            say(text="Sorry, I couldn't generate a response.", thread_ts=thread_ts)
+
+
+    @app.event("reaction_added")
+    def handle_reaction_added(event, logger):
+        """Handle emoji reactions added to messages."""
+        if IS_DUMMY_APP: return # Don't process if app isn't fully initialized
+
+        item_user = event.get("item_user")
+        item_ts = event.get("item", {}).get("ts")
+        reaction = event.get("reaction")
+
+        if item_user == bot_user_id and item_ts in bot_message_timestamps:
+            emoji_tally[reaction] += 1
+            logger.info(f"Reaction :{reaction}: added to bot message {item_ts}. Tally: {emoji_tally[reaction]}")
+
+
+
+    @app.event("message")
+    def handle_message_events(event, say, client, logger):
+        """Handle direct messages and other message events."""
+        if IS_DUMMY_APP: return # Don't process if app isn't fully initialized
+
+        channel_type = event.get("channel_type")
+        user_id = event.get("user")
+        text = event.get("text", "")
+        thread_ts = event.get("thread_ts") # Handle threads if DMs support them
+
+        if user_id == bot_user_id or not text or not user_id:
+            return
+
+        if channel_type == "im":
+            logger.info(f"Received DM from {user_id}: {text}")
+            channel_id = event["channel"] # DM channel ID
+
+            if text.lower() == "stats":
+                say(text="Sorry, channel stats are not available in DMs.", thread_ts=thread_ts)
+                return
+            if text.lower() == "cost":
+                cost_text = "OpenAI API Usage Costs:\n"
+                if not openai_usage_costs: cost_text += "No usage recorded yet."
+                else:
+                    for model, cost in openai_usage_costs.items(): cost_text += f"- {model}: ${cost:.6f}\n"
+                    cost_text += "\nToken Counts:\n"
+                    for model, counts in openai_token_counts.items(): cost_text += f"- {model}: Prompt={counts['prompt_tokens']}, Completion={counts['completion_tokens']}, Total={counts['total_tokens']}\n"
+                say(text=cost_text, thread_ts=thread_ts)
+                return
+            if text.lower() == "emojis":
+                emoji_text = "Emoji Reaction Tally (on my messages):\n"
+                if not emoji_tally: emoji_text += "No reactions recorded yet."
+                else:
+                    for emoji, count in emoji_tally.items(): emoji_text += f"- :{emoji}:: {count}\n"
+                say(text=emoji_text, thread_ts=thread_ts)
+                return
+
+            use_web_search = True # Enable web search by default
+            # history_formatted = format_conversation_history_for_openai(history, client)
+            response_text, usage = get_openai_response([], text, web_search=True) # No history for DMs for now
+
+            if response_text:
+                say_result = say(text=response_text, thread_ts=thread_ts)
+                record_bot_message(say_result)
+            else:
+                say(text="Sorry, I couldn't generate a response.", thread_ts=thread_ts)
+
+    @app.error
+    def error_handler(error, body, logger):
+        logger.error(f"Error: {error}")
+        logger.debug(f"Body: {body}")
+
+    return app
 
 def get_random_rude_phrase():
     """Return a randomly selected rude phrase"""
@@ -198,8 +336,6 @@ def record_bot_message(say_result: Optional[Dict[str, Any]]):
         bot_message_timestamps.add(say_result["ts"])
         logger.debug(f"Recorded bot message timestamp: {say_result['ts']}")
 
-
-
 def update_channel_stats(channel_id, user_id, message_ts):
     """Update the channel statistics"""
     if channel_id not in channel_data:
@@ -226,133 +362,11 @@ def get_channel_stats(channel_id):
     
     return channel_data[channel_id]
 
-@app.event("app_mention")
-def handle_mention(event, say, client, logger):
-    if IS_DUMMY_APP:
-        say("Slack app is not fully initialized. Cannot process mentions.")
-        return
-
-    channel_id = event["channel"]
-    user_id = event["user"]
-    message_ts = event["ts"]
-    text = event.get("text", "")
-    thread_ts = event.get("thread_ts") # Handle threads
-
-    prompt = re.sub(f"<@{bot_user_id}>", "", text).strip()
-
-    if prompt.lower() == "stats":
-        stats = get_channel_stats(channel_id)
-        participants_list = ", ".join([f"<@{user}>" for user in stats["participants"]])
-        stats_text = (f"Channel Stats ({channel_id}):\n"
-                      f"- Messages: {stats['message_count']}\n"
-                      f"- Participants ({len(stats['participants'])}): {participants_list}\n"
-                      f"- Last Updated: {stats['last_updated']}")
-        say(text=stats_text, thread_ts=thread_ts) # Reply in thread if applicable
-        return
-    if prompt.lower() == "cost":
-        cost_text = "OpenAI API Usage Costs:\n"
-        if not openai_usage_costs: cost_text += "No usage recorded yet."
-        else:
-            for model, cost in openai_usage_costs.items():
-                cost_text += f"- {model}: ${cost:.6f}\n"
-            cost_text += "\nToken Counts:\n"
-            for model, counts in openai_token_counts.items():
-                cost_text += f"- {model}: Prompt={counts['prompt_tokens']}, Completion={counts['completion_tokens']}, Total={counts['total_tokens']}\n"
-        say(text=cost_text, thread_ts=thread_ts)
-        return
-    if prompt.lower() == "emojis":
-        emoji_text = "Emoji Reaction Tally (on my messages):\n"
-        if not emoji_tally: emoji_text += "No reactions recorded yet."
-        else:
-            for emoji, count in emoji_tally.items():
-                emoji_text += f"- :{emoji}:: {count}\n"
-        say(text=emoji_text, thread_ts=thread_ts)
-        return
-
-    update_channel_stats(channel_id, user_id, message_ts)
-
-    use_web_search = True # Enable web search by default
-
-    history = get_channel_history(client, channel_id, limit=1000) # Fetch up to 1000 messages
-    history_limit_reached = len(history) == 1000
-    history_formatted = format_conversation_history_for_openai(history, client)
-    response_text, usage = get_openai_response(history_formatted, prompt, web_search=True)
-    if history_limit_reached:
-        response_text = "(Note: I could only access the last 1000 messages in this channel for context.)\n\n" + (response_text or "")
-
-    if response_text:
-        say_result = say(text=response_text, thread_ts=thread_ts) # Reply in thread if applicable
-        record_bot_message(say_result)
+if __name__ == "__main__":
+    from slack_bolt.adapter.socket_mode import SocketModeHandler
+    app = create_slack_app()
+    if not IS_DUMMY_APP:
+        logger.info("Starting SocketModeHandler for ChatDSJ bot...")
+        SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
     else:
-        say(text="Sorry, I couldn't generate a response.", thread_ts=thread_ts)
-
-
-@app.event("reaction_added")
-def handle_reaction_added(event, logger):
-    """Handle emoji reactions added to messages."""
-    if IS_DUMMY_APP: return # Don't process if app isn't fully initialized
-
-    item_user = event.get("item_user")
-    item_ts = event.get("item", {}).get("ts")
-    reaction = event.get("reaction")
-
-    if item_user == bot_user_id and item_ts in bot_message_timestamps:
-        emoji_tally[reaction] += 1
-        logger.info(f"Reaction :{reaction}: added to bot message {item_ts}. Tally: {emoji_tally[reaction]}")
-
-
-
-@app.event("message")
-def handle_message_events(event, say, client, logger):
-    """Handle direct messages and other message events."""
-    if IS_DUMMY_APP: return # Don't process if app isn't fully initialized
-
-    channel_type = event.get("channel_type")
-    user_id = event.get("user")
-    text = event.get("text", "")
-    thread_ts = event.get("thread_ts") # Handle threads if DMs support them
-
-    if user_id == bot_user_id or not text or not user_id:
-        return
-
-    if channel_type == "im":
-        logger.info(f"Received DM from {user_id}: {text}")
-        channel_id = event["channel"] # DM channel ID
-
-        if text.lower() == "stats":
-            say(text="Sorry, channel stats are not available in DMs.", thread_ts=thread_ts)
-            return
-        if text.lower() == "cost":
-            cost_text = "OpenAI API Usage Costs:\n"
-            if not openai_usage_costs: cost_text += "No usage recorded yet."
-            else:
-                for model, cost in openai_usage_costs.items(): cost_text += f"- {model}: ${cost:.6f}\n"
-                cost_text += "\nToken Counts:\n"
-                for model, counts in openai_token_counts.items(): cost_text += f"- {model}: Prompt={counts['prompt_tokens']}, Completion={counts['completion_tokens']}, Total={counts['total_tokens']}\n"
-            say(text=cost_text, thread_ts=thread_ts)
-            return
-        if text.lower() == "emojis":
-            emoji_text = "Emoji Reaction Tally (on my messages):\n"
-            if not emoji_tally: emoji_text += "No reactions recorded yet."
-            else:
-                for emoji, count in emoji_tally.items(): emoji_text += f"- :{emoji}:: {count}\n"
-            say(text=emoji_text, thread_ts=thread_ts)
-            return
-
-        use_web_search = True # Enable web search by default
-        # history_formatted = format_conversation_history_for_openai(history, client)
-        response_text, usage = get_openai_response([], text, web_search=True) # No history for DMs for now
-
-        if response_text:
-            say_result = say(text=response_text, thread_ts=thread_ts)
-            record_bot_message(say_result)
-        else:
-            say(text="Sorry, I couldn't generate a response.", thread_ts=thread_ts)
-
-    # else:
-
-
-@app.error
-def error_handler(error, body, logger):
-    logger.error(f"Error: {error}")
-    logger.debug(f"Body: {body}")
+        logger.warning("App running in dummy mode. No SocketModeHandler started.")
