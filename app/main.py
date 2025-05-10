@@ -13,9 +13,6 @@ load_dotenv()
 slack_app = create_slack_app()
 app = FastAPI()
 
-if not IS_DUMMY_APP:
-    SocketModeHandler(slack_app, os.environ["SLACK_APP_TOKEN"]).start()
-
 # Disable CORS. Do not remove this for full-stack development.
 app.add_middleware(
     CORSMiddleware,

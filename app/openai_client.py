@@ -37,7 +37,11 @@ def get_chat_completion(prompt: str, conversation_history: Optional[List[Dict[st
     ]
     if conversation_history:
         messages.extend(conversation_history)
-    messages.append({"role": "user", "content": prompt})
+    instruction = (
+        f"Use the context above to respond to the user's last message: \"{prompt}\".\n"
+        f"Provide a concise, helpful response as if participating in the same Slack conversation."
+    )
+    messages.append({"role": "user", "content": instruction})
 
     tools = []
     if use_web_search:

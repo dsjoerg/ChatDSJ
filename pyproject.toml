@@ -13,7 +13,7 @@ slack-bolt = "^1.23.0"
 python-dotenv = "^1.1.0"
 slack-sdk = {extras = ["socket-mode"], version = "^3.35.0"}
 openai = "^1.73.0"
-
+notion-client = "^2.0.0" # Or the latest version, check PyPI
 
 [build-system]
 requires = ["poetry-core"]
